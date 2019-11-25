@@ -66,40 +66,49 @@ impl LogFileTailer {
         let reader = self.reader.clone();
         let mut buf = String::new();
 
-        thread::spawn(move || loop {
-            let rx = rx.lock().unwrap();
-            match rx.recv() {
-                Ok(RawEvent {
-                    path: Some(path),
-                    op: Ok(Op::WRITE),
-                    cookie: _cookie,
-                }) => {
-                    let sender = sender.lock().unwrap();
-                    let mut reader = reader.lock().unwrap();
+        let span = span!(Level::DEBUG, "start");
 
-                    loop {
-                        match reader.read_line(&mut buf) {
-                            // we have reached the end of the file
-                            Ok(0) => break,
-                            Ok(_) => sender
-                                .send(LogEvent {
-                                    filename: path.clone(),
-                                    line: buf.clone(),
-                                })
-                                .unwrap(),
-                            Err(e) => return Err(e),
+        thread::spawn(move || {
+            let _enter = span.enter();
+            loop {
+                let rx = rx.lock().unwrap();
+                match rx.recv() {
+                    Ok(RawEvent {
+                        path: Some(path),
+                        op: Ok(Op::WRITE),
+                        cookie: _cookie,
+                    }) => {
+                        event!(Level::DEBUG, ?path, "file write notification");
+                        let sender = sender.lock().unwrap();
+                        let mut reader = reader.lock().unwrap();
+
+                        loop {
+                            match reader.read_line(&mut buf) {
+                                // we have reached the end of the file
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    event!(Level::DEBUG, "sending line");
+                                    sender
+                                        .send(LogEvent {
+                                            filename: path.clone(),
+                                            line: buf.clone(),
+                                        })
+                                        .unwrap()
+                                }
+                                Err(e) => return Err(e),
+                            }
+
+                            buf.clear();
                         }
-
-                        buf.clear();
                     }
-                }
-                Ok(_) => {
-                    // Some other event
-                    // TODO: handle file renaming or deletion
-                }
-                Err(err) => {
-                    eprintln!("error: {:?}", err);
-                    break Ok(());
+                    Ok(_) => {
+                        // Some other event
+                        // TODO: handle file renaming or deletion
+                    }
+                    Err(err) => {
+                        eprintln!("error: {:?}", err);
+                        break Ok(());
+                    }
                 }
             }
         });
@@ -134,6 +143,7 @@ fn main() -> Result<()> {
         tailers.push(Box::new(tailer));
     }
 
+    // Clear the span
     drop(enter);
 
     event!(Level::INFO, "watching {} sources", tailers.len());
