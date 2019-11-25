@@ -1,11 +1,13 @@
 use chrono::prelude::*;
 use notify::{op::Op, raw_watcher, RawEvent, RecursiveMode, Watcher};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use structopt::StructOpt;
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tracing::{event, span, Level};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -23,6 +25,7 @@ struct Opt {
 struct LogEvent {
     filename: PathBuf,
     line: String,
+    tailer_idx: usize,
 }
 
 struct LogFileTailer {
@@ -35,10 +38,12 @@ struct LogFileTailer {
     _watcher: notify::inotify::INotifyWatcher,
 
     reader: Arc<Mutex<BufReader<File>>>,
+
+    tailer_idx: usize,
 }
 
 impl LogFileTailer {
-    fn new<P>(path: P, sender: mpsc::Sender<LogEvent>) -> Result<Self>
+    fn new<P>(path: P, tailer_idx: usize, sender: mpsc::Sender<LogEvent>) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -57,6 +62,7 @@ impl LogFileTailer {
             rx: Arc::new(Mutex::new(rx)),
             _watcher: watcher,
             reader: Arc::new(Mutex::new(reader)),
+            tailer_idx,
         })
     }
 
@@ -67,6 +73,7 @@ impl LogFileTailer {
         let mut buf = String::new();
 
         let span = span!(Level::DEBUG, "start");
+        let tailer_idx = self.tailer_idx;
 
         thread::spawn(move || {
             let _enter = span.enter();
@@ -92,6 +99,7 @@ impl LogFileTailer {
                                         .send(LogEvent {
                                             filename: path.clone(),
                                             line: buf.clone(),
+                                            tailer_idx,
                                         })
                                         .unwrap()
                                 }
@@ -131,6 +139,8 @@ fn main() -> Result<()> {
 
     // Keep track of all tailers so that their channels do not get closed
     let mut tailers: Vec<Box<dyn Tailer>> = Vec::new();
+    let mut tailer_idx = 0;
+    let mut tailer_colours = HashMap::new();
 
     let span = span!(Level::INFO, "adding-files");
     let enter = span.enter();
@@ -138,9 +148,16 @@ fn main() -> Result<()> {
     // Start by adding the files requested
     for file in opts.files {
         event!(Level::INFO, ?file);
-        let mut tailer = LogFileTailer::new(file, tx.clone())?;
+        let mut tailer = LogFileTailer::new(file, tailer_idx, tx.clone())?;
         tailer.start();
         tailers.push(Box::new(tailer));
+
+        let rcolour = random_color::RandomColor::new().to_rgb_array();
+
+        let colour = Color::Rgb(rcolour[0] as _, rcolour[1] as _, rcolour[2] as _);
+
+        tailer_colours.insert(tailer_idx, colour);
+        tailer_idx += 1;
     }
 
     // Clear the span
@@ -148,11 +165,18 @@ fn main() -> Result<()> {
 
     event!(Level::INFO, "watching {} sources", tailers.len());
 
+    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+
     loop {
         let event = rx.recv()?;
         if let Some(p) = event.filename.to_str() {
             let utc: DateTime<Utc> = Utc::now();
-            println!("{} [{}]: {}", utc, p, event.line.trim());
+
+            write!(stdout, "{} [", utc)?;
+            stdout.set_color(ColorSpec::new().set_fg(Some(tailer_colours[&event.tailer_idx])))?;
+            write!(stdout, "{}", p)?;
+            stdout.reset()?;
+            writeln!(stdout, "]: {}", event.line.trim())?;
         }
     }
 }
