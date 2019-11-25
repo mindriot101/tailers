@@ -13,4 +13,5 @@ coloured label representing the original source.
 
 ## Implementation
 
-The program is written in Rust using async-std.
+The program is written in Rust. It uses threads and channels, but aspires to
+transition to the async ecosystem (`tokio`/`async-std`).
