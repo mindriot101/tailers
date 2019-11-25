@@ -1,7 +1,12 @@
-use notify::{raw_watcher, RawEvent, RecursiveMode, Watcher};
-use std::sync::mpsc;
+#[allow(unreachable_code)]
+use notify::{op::Op, raw_watcher, RawEvent, RecursiveMode, Watcher};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use structopt::StructOpt;
-use tracing::{debug, info, span, warn, Level};
+use tracing::{event, Level};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -14,52 +19,122 @@ struct Opt {
     // TODO: kubernetes
 }
 
+#[derive(Debug)]
+struct LogEvent {
+    filename: PathBuf,
+    line: String,
+}
+
+struct LogFileTailer {
+    // Sender for the outer channel which broadcasts log messages
+    sender: Arc<Mutex<mpsc::Sender<LogEvent>>>,
+
+    // Receiver for the notifications
+    rx: Arc<Mutex<mpsc::Receiver<RawEvent>>>,
+    // TODO: make this generic over this parameter to support other operating systems
+    _watcher: notify::inotify::INotifyWatcher,
+
+    reader: Arc<Mutex<BufReader<File>>>,
+}
+
+impl LogFileTailer {
+    fn new<P>(path: P, sender: mpsc::Sender<LogEvent>) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let (tx, rx) = mpsc::channel();
+        // TODO: single shared watcher for the whole crate?
+        let mut watcher = raw_watcher(tx)?;
+        watcher.watch(&path, RecursiveMode::NonRecursive)?;
+
+        // Get the last seek position of the file to continue from
+        let mut f = File::open(&path)?;
+        f.seek(SeekFrom::End(0))?;
+        let reader = BufReader::new(f);
+
+        Ok(Self {
+            sender: Arc::new(Mutex::new(sender)),
+            rx: Arc::new(Mutex::new(rx)),
+            _watcher: watcher,
+            reader: Arc::new(Mutex::new(reader)),
+        })
+    }
+
+    fn start(&mut self) {
+        let rx = self.rx.clone();
+        let sender = self.sender.clone();
+        let reader = self.reader.clone();
+
+        thread::spawn(move || loop {
+            let rx = rx.lock().unwrap();
+            match rx.recv() {
+                Ok(RawEvent {
+                    path: Some(path),
+                    op: Ok(Op::WRITE),
+                    cookie: _cookie,
+                }) => {
+                    let sender = sender.lock().unwrap();
+                    let mut reader = reader.lock().unwrap();
+
+                    let mut buf = String::new();
+                    loop {
+                        match reader.read_line(&mut buf) {
+                            // we have reached the end of the file
+                            Ok(0) => break,
+                            Ok(_) => sender
+                                .send(LogEvent {
+                                    filename: path.clone(),
+                                    line: buf.trim_end().to_string(),
+                                })
+                                .unwrap(),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Some other event
+                    // TODO: handle file renaming or deletion
+                }
+                Err(err) => {
+                    eprintln!("error: {:?}", err);
+                    break Ok(());
+                }
+            }
+        });
+    }
+}
+
+trait Tailer {}
+
+impl Tailer for LogFileTailer {}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    info!("Program starting");
+    event!(Level::INFO, "Program starting");
 
     let opts = Opt::from_args();
 
-    // Check that we have actually been given some files to log
-    // TODO: check the other arguments as well
-    if opts.files.len() == 0 {
-        warn!("no tailers requested, quitting");
-        std::process::exit(1);
-    }
-
+    // Message channel for receiving new messages from all tailers
     let (tx, rx) = mpsc::channel();
 
-    let span = span!(Level::TRACE, "adding-files");
-    let enter = span.enter();
+    // Keep track of all tailers so that their channels do not get closed
+    let mut tailers: Vec<Box<dyn Tailer>> = Vec::new();
 
-    let mut watcher = raw_watcher(tx)?;
-    for fname in opts.files {
-        info!(%fname, "tailing log file");
-        watcher.watch(fname, RecursiveMode::NonRecursive)?;
+    // Start by adding the files requested
+    for file in opts.files {
+        event!(Level::INFO, ?file, "adding file");
+        let mut tailer = LogFileTailer::new(file, tx.clone()).unwrap();
+        tailer.start();
+        tailers.push(Box::new(tailer));
     }
-    drop(enter);
 
-    info!("waiting for messages");
+    event!(Level::INFO, "watching {} sources", tailers.len());
+
     loop {
-        match rx.recv() {
-            Ok(RawEvent {
-                path: Some(path),
-                op: Ok(op),
-                cookie: _cookie,
-            }) => {
-                println!("got raw event {:?}, {:?}", path, op);
-            }
-            Ok(event) => {
-                eprintln!("got broken event: {:?}", event);
-                break;
-            }
-            Err(err) => {
-                eprintln!("error: {:?}", err);
-                break;
-            }
+        let event = rx.recv()?;
+        if let Some(p) = event.filename.to_str() {
+            println!("{}: {}", p, event.line);
         }
     }
-
-    Ok(())
 }
