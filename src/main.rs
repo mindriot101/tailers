@@ -109,9 +109,10 @@ impl LogFileTailer {
                             buf.clear();
                         }
                     }
-                    Ok(_) => {
+                    Ok(e) => {
                         // Some other event
                         // TODO: handle file renaming or deletion
+                        event!(Level::WARN, ?e, "unhandled file event");
                     }
                     Err(err) => {
                         eprintln!("error: {:?}", err);
