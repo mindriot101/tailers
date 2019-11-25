@@ -1,4 +1,4 @@
-#[allow(unreachable_code)]
+use chrono::prelude::*;
 use notify::{op::Op, raw_watcher, RawEvent, RecursiveMode, Watcher};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
