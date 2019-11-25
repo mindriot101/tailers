@@ -2,10 +2,10 @@
 
 Multi-tail program capable of tailing:
 
-* log files
-* docker containers
-* kubernetes logs
-* network messages
+* [x] log files
+* [ ] docker containers
+* [ ] kubernetes logs
+* [ ] network messages
 * ...
 
 The user interface merges all streams into one and prefixes each stream with a
