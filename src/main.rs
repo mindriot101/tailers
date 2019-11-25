@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use structopt::StructOpt;
-use tracing::{event, Level};
+use tracing::{event, span, Level};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -64,6 +64,7 @@ impl LogFileTailer {
         let rx = self.rx.clone();
         let sender = self.sender.clone();
         let reader = self.reader.clone();
+        let mut buf = String::new();
 
         thread::spawn(move || loop {
             let rx = rx.lock().unwrap();
@@ -76,7 +77,6 @@ impl LogFileTailer {
                     let sender = sender.lock().unwrap();
                     let mut reader = reader.lock().unwrap();
 
-                    let mut buf = String::new();
                     loop {
                         match reader.read_line(&mut buf) {
                             // we have reached the end of the file
@@ -84,11 +84,13 @@ impl LogFileTailer {
                             Ok(_) => sender
                                 .send(LogEvent {
                                     filename: path.clone(),
-                                    line: buf.trim_end().to_string(),
+                                    line: buf.clone(),
                                 })
                                 .unwrap(),
                             Err(e) => return Err(e),
                         }
+
+                        buf.clear();
                     }
                 }
                 Ok(_) => {
@@ -121,20 +123,26 @@ fn main() -> Result<()> {
     // Keep track of all tailers so that their channels do not get closed
     let mut tailers: Vec<Box<dyn Tailer>> = Vec::new();
 
+    let span = span!(Level::INFO, "adding-files");
+    let enter = span.enter();
+
     // Start by adding the files requested
     for file in opts.files {
-        event!(Level::INFO, ?file, "adding file");
-        let mut tailer = LogFileTailer::new(file, tx.clone()).unwrap();
+        event!(Level::INFO, ?file);
+        let mut tailer = LogFileTailer::new(file, tx.clone())?;
         tailer.start();
         tailers.push(Box::new(tailer));
     }
+
+    drop(enter);
 
     event!(Level::INFO, "watching {} sources", tailers.len());
 
     loop {
         let event = rx.recv()?;
         if let Some(p) = event.filename.to_str() {
-            println!("{}: {}", p, event.line);
+            let utc: DateTime<Utc> = Utc::now();
+            println!("{} [{}]: {}", utc, p, event.line.trim());
         }
     }
 }
